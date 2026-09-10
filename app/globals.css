@@ -66,3 +66,74 @@
     @apply bg-background text-foreground;
   }
 }
+@keyframes toxicGlow {
+  0%, 100% {
+    text-shadow:
+      0 0 5px #7fff00,
+      0 0 15px #7fff00,
+      0 0 30px #39ff14,
+      0 0 45px #00ffcc;
+  }
+  50% {
+    text-shadow:
+      0 0 10px #7fff00,
+      0 0 25px #7fff00,
+      0 0 45px #39ff14,
+      0 0 65px #00ffcc;
+  }
+}
+
+.marquee {
+  display: inline-flex;
+  animation: scrollLeft 12s linear infinite;
+}
+
+.layer-stack {
+  position: relative;
+  display: inline-block;
+  padding-right: 6vw;
+}
+
+.layer-stack::before,
+.layer-stack::after {
+  content: "Rushil's Website BITCHES";
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+/* Base visible text = teal (front layer) */
+.layer-stack {
+  color: #00ffaa;
+  -webkit-text-stroke: 1px #00ffaa;
+}
+
+/* Green layer, behind teal */
+.layer-stack::before {
+  content: "Rushil's Website BITCHES";
+  color: #55ff33;
+  -webkit-text-stroke: 5px #55ff33;
+  z-index: -1;
+}
+
+/* Black layer with glow, furthest back */
+.layer-stack::after {
+  content: "Rushil's Website BITCHES";
+  color: black;
+  -webkit-text-stroke: 14px black;
+  text-shadow:
+    0 0 20px #aaff00,
+    0 0 40px #55ff33,
+    0 0 60px #00ffaa;
+  animation: toxicGlow 2s ease-in-out infinite;
+  z-index: -2;
+}
+
+@keyframes scrollLeft {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
