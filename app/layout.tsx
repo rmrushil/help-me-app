@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Sedgwick_Ave_Display } from "next/font/google";
+import { Orbitron } from "next/font/google";
 import { ThemeProvider } from "next-themes";
 import "./globals.css";
 
@@ -13,8 +13,8 @@ export const metadata: Metadata = {
   description: "The fastest way to build apps with Next.js and Supabase",
 };
 
-const graffitiFont = Sedgwick_Ave_Display({
-  weight: "400",
+const techFont = Orbitron({
+  weight: ["400", "700", "900"],
   subsets: ["latin"],
 });
 
@@ -25,7 +25,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={`${graffitiFont.className} antialiased`}>
+      <body className={`${techFont.className} antialiased`}>
         <ThemeProvider
           attribute="class"
           defaultTheme="system"
