@@ -21,9 +21,3 @@ A simple, collaborative to-do list tracker designed for teams and groups to mana
 
 ---
 
-## 🚀 Getting Started Locally
-
-1. **Clone the repository:**
-   ```bash
-   git clone <your-repo-url>
-   cd <your-repo-folder>
