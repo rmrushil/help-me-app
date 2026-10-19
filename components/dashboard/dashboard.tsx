@@ -4,17 +4,22 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { AssignDialog, EditDialog, ExtendDialog, PromptDialog } from "./dialogs";
+import GroupPanel from "./group-panel";
+import type { MemberRow } from "./group-panel";
 import TaskTable from "./task-table";
 import { TASK_COLUMNS, addDays, asRows, btnClass, todayString } from "./helpers";
 import type { Group, Member, Profile, Scope, Task, View } from "./helpers";
 
-type DialogName = "create" | "join" | "edit" | "extend" | "assign" | null;
+type DialogName = "create" | "join" | "edit" | "extend" | "assign" | "manage" | null;
+type Stats = { open: number; overdue: number; done: number };
 
 const VIEW_LABELS: Record<View, string> = {
   home: "Home",
   overdue: "Overdue",
   completed: "Completed",
 };
+
+const NO_STATS: Stats = { open: 0, overdue: 0, done: 0 };
 
 export default function Dashboard({ userId, email }: { userId: string; email: string }) {
   const router = useRouter();
@@ -28,7 +33,7 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  // What the user is looking at
+  // Where the user is: a scope ("all", "personal", or a group id) plus a view
   const [view, setView] = useState<View>("home");
   const [scope, setScope] = useState<Scope>("all");
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -37,6 +42,7 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
   // Small interface switches
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [groupsOpen, setGroupsOpen] = useState(true);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -62,17 +68,58 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
       supabase.from("tasks").select(TASK_COLUMNS),
     ]);
     const firstError = g.error ?? m.error ?? p.error ?? t.error;
-    if (firstError) setError(firstError.message);
-    setGroups(asRows<Group>(g.data));
-    setMembers(asRows<Member>(m.data));
-    setProfiles(asRows<Profile>(p.data));
-    setTasks(asRows<Task>(t.data));
+    if (firstError) {
+      setError(firstError.message);
+    } else {
+      const loadedGroups = asRows<Group>(g.data);
+      setGroups(loadedGroups);
+      // If the group being viewed is gone (deleted, or you were removed), go back to Home
+      setScope((prev) =>
+        prev === "all" || prev === "personal" || loadedGroups.some((x) => x.id === prev)
+          ? prev
+          : "all"
+      );
+      setMembers(asRows<Member>(m.data));
+      setProfiles(asRows<Profile>(p.data));
+      setTasks(asRows<Task>(t.data));
+    }
     setLoading(false);
   }, [supabase]);
 
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+  // Live updates: when anything changes in the database, reload shortly after.
+  // Also reload when you come back to this browser tab.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    function refreshSoon() {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        loadAll();
+      }, 300);
+    }
+
+    const channel = supabase
+      .channel("helpme-live")
+      .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, refreshSoon)
+      .on("postgres_changes", { event: "*", schema: "public", table: "group_members" }, refreshSoon)
+      .on("postgres_changes", { event: "*", schema: "public", table: "groups" }, refreshSoon)
+      .on("postgres_changes", { event: "*", schema: "public", table: "profiles" }, refreshSoon)
+      .subscribe();
+
+    function onVisible() {
+      if (document.visibilityState === "visible") refreshSoon();
+    }
+    document.addEventListener("visibilitychange", onVisible);
+
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      supabase.removeChannel(channel);
+    };
+  }, [supabase, loadAll]);
 
   // ---------- Derived data ----------
   const profileName = useMemo(
@@ -84,7 +131,31 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
     [groups]
   );
 
-  // Tasks inside the chosen group (or all / personal)
+  // Counts for the sidebar badges, for "all", for "personal", and for each group
+  const stats = useMemo(() => {
+    const map = new Map<string, Stats>();
+    function bump(key: string, t: Task) {
+      const s = map.get(key) ?? { open: 0, overdue: 0, done: 0 };
+      if (t.is_done) {
+        s.done += 1;
+      } else {
+        s.open += 1;
+        if (t.due_date !== null && t.due_date < today) s.overdue += 1;
+      }
+      map.set(key, s);
+    }
+    for (const t of tasks) {
+      bump("all", t);
+      bump(t.group_id ?? "personal", t);
+    }
+    return map;
+  }, [tasks, today]);
+
+  function statsFor(key: string): Stats {
+    return stats.get(key) ?? NO_STATS;
+  }
+
+  // Tasks inside the chosen scope
   const scoped = useMemo(
     () =>
       tasks.filter((t) => {
@@ -94,15 +165,6 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
       }),
     [tasks, scope]
   );
-
-  const counts = useMemo(() => {
-    const open = scoped.filter((t) => !t.is_done);
-    return {
-      open: open.length,
-      overdue: open.filter((t) => t.due_date !== null && t.due_date < today).length,
-      done: scoped.length - open.length,
-    };
-  }, [scoped, today]);
 
   // Tasks for the chosen view (Home / Overdue / Completed), sorted
   const visible = useMemo(() => {
@@ -142,25 +204,41 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
     : [];
 
   const currentGroup = groups.find((g) => g.id === scope);
-  const memberCount = members.filter((m) => m.group_id === scope).length;
-  const scopeLabel =
-    scope === "all" ? "All tasks" : scope === "personal" ? "Personal" : (currentGroup?.name ?? "Group");
+  const memberRows: MemberRow[] = currentGroup
+    ? members
+        .filter((m) => m.group_id === currentGroup.id)
+        .map((m) => ({
+          userId: m.user_id,
+          name: profileName.get(m.user_id) ?? "Unknown",
+          role: m.role,
+        }))
+    : [];
+  const isAdmin = memberRows.some((m) => m.userId === userId && m.role === "admin");
 
-  // ---------- Selection and navigation ----------
-  function closeSidebarOnPhone() {
+  const scopeLabel =
+    scope === "all" ? "" : scope === "personal" ? "Personal" : (currentGroup?.name ?? "Group");
+  const breadcrumb = scopeLabel ? `${VIEW_LABELS[view]} / ${scopeLabel}` : VIEW_LABELS[view];
+
+  // ---------- Navigation and selection ----------
+  // Every sidebar click sets the scope and the view together,
+  // so clicking a group always shows that group's open tasks.
+  function go(nextScope: Scope, nextView: View) {
+    setScope(nextScope);
+    setView(nextView);
+    setSelected(new Set());
+    if (nextScope !== "all") {
+      setExpanded((prev) => new Set(prev).add(nextScope));
+    }
     if (window.innerWidth < 768) setSidebarOpen(false);
   }
 
-  function chooseView(v: View) {
-    setView(v);
-    setSelected(new Set());
-    closeSidebarOnPhone();
-  }
-
-  function chooseScope(s: Scope) {
-    setScope(s);
-    setSelected(new Set());
-    closeSidebarOnPhone();
+  function toggleExpanded(key: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
   }
 
   function toggleOne(id: string) {
@@ -209,6 +287,8 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
     return err;
   }
 
+  // Complete marks tasks done. In the Completed view the same button reopens them.
+  // Reopening only flips the done flag, so each task returns to the group it was in.
   async function completeSelected() {
     setError("");
     const err = await updateEach(
@@ -288,9 +368,7 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
     const { data, error: rpcError } = await supabase.rpc("create_group", { group_name: name });
     if (rpcError) return rpcError.message;
     await loadAll();
-    setScope(data as unknown as string);
-    setView("home");
-    setSelected(new Set());
+    go(data as unknown as string, "home");
     return null;
   }
 
@@ -298,9 +376,79 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
     const { data, error: rpcError } = await supabase.rpc("join_group", { code });
     if (rpcError) return rpcError.message;
     await loadAll();
-    setScope(data as unknown as string);
-    setView("home");
-    setSelected(new Set());
+    go(data as unknown as string, "home");
+    return null;
+  }
+
+  async function renameGroup(name: string) {
+    if (!currentGroup) return "No group selected.";
+    const { data, error: updateError } = await supabase
+      .from("groups")
+      .update({ name })
+      .eq("id", currentGroup.id)
+      .select("id");
+    if (updateError) return updateError.message;
+    if (asRows<{ id: string }>(data).length === 0) return "Only admins can rename the group.";
+    await loadAll();
+    return null;
+  }
+
+  async function changeRole(target: string, newRole: "admin" | "member") {
+    if (!currentGroup) return "No group selected.";
+    const { error: rpcError } = await supabase.rpc("set_member_role", {
+      gid: currentGroup.id,
+      target,
+      new_role: newRole,
+    });
+    if (rpcError) return rpcError.message;
+    await loadAll();
+    return null;
+  }
+
+  async function removeMember(target: string) {
+    if (!currentGroup) return "No group selected.";
+    const { error: rpcError } = await supabase.rpc("remove_member", {
+      gid: currentGroup.id,
+      target,
+    });
+    if (rpcError) return rpcError.message;
+    await loadAll();
+    return null;
+  }
+
+  async function resetCode() {
+    if (!currentGroup) return "No group selected.";
+    const { error: rpcError } = await supabase.rpc("reset_invite_code", {
+      gid: currentGroup.id,
+    });
+    if (rpcError) return rpcError.message;
+    await loadAll();
+    return null;
+  }
+
+  async function leaveGroup() {
+    if (!currentGroup) return "No group selected.";
+    const { error: rpcError } = await supabase.rpc("remove_member", {
+      gid: currentGroup.id,
+      target: userId,
+    });
+    if (rpcError) return rpcError.message;
+    go("all", "home");
+    await loadAll();
+    return null;
+  }
+
+  async function deleteGroup() {
+    if (!currentGroup) return "No group selected.";
+    const { data, error: deleteError } = await supabase
+      .from("groups")
+      .delete()
+      .eq("id", currentGroup.id)
+      .select("id");
+    if (deleteError) return deleteError.message;
+    if (asRows<{ id: string }>(data).length === 0) return "Only admins can delete the group.";
+    go("all", "home");
+    await loadAll();
     return null;
   }
 
@@ -317,6 +465,10 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
   }
 
   const count = selectedTasks.length;
+  const groupEntries = [
+    { key: "personal", label: "Personal" },
+    ...groups.map((g) => ({ key: g.id, label: g.name })),
+  ];
 
   return (
     <div className="hud-bg flex h-screen flex-col text-[#6dffc4]">
@@ -331,9 +483,7 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
             ☰
           </button>
           <span className="jarvis-text">HelpME</span>
-          <span className="truncate text-sm opacity-60">
-            / {scopeLabel} / {VIEW_LABELS[view]}
-          </span>
+          <span className="truncate text-sm opacity-60">/ {breadcrumb}</span>
         </div>
 
         <div className="relative">
@@ -361,16 +511,16 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
       <div className="relative flex min-h-0 flex-1">
         {/* Sidebar */}
         <aside
-          className={`absolute left-0 top-0 z-20 h-full shrink-0 overflow-hidden border-[#3ddc97]/30 bg-[#07110d] transition-[width] duration-300 motion-reduce:transition-none md:static ${
+          className={`absolute left-0 top-0 z-20 h-full shrink-0 overflow-y-auto overflow-x-hidden border-[#3ddc97]/30 bg-[#07110d] transition-[width] duration-300 motion-reduce:transition-none md:static ${
             sidebarOpen ? "w-60 border-r" : "w-0"
           }`}
         >
           <nav className="flex w-60 flex-col gap-1 p-3">
             <NavItem
               label="Home"
-              active={view === "home"}
-              badge={counts.open}
-              onClick={() => chooseView("home")}
+              active={scope === "all" && view === "home"}
+              badge={statsFor("all").open}
+              onClick={() => go("all", "home")}
             />
 
             <button
@@ -383,22 +533,17 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
             </button>
             {groupsOpen && (
               <div className="ml-3 flex flex-col gap-1 border-l border-[#3ddc97]/20 pl-2">
-                <NavItem
-                  label="All tasks"
-                  active={scope === "all"}
-                  onClick={() => chooseScope("all")}
-                />
-                <NavItem
-                  label="Personal"
-                  active={scope === "personal"}
-                  onClick={() => chooseScope("personal")}
-                />
-                {groups.map((g) => (
-                  <NavItem
-                    key={g.id}
-                    label={g.name}
-                    active={scope === g.id}
-                    onClick={() => chooseScope(g.id)}
+                {groupEntries.map((entry) => (
+                  <GroupNavEntry
+                    key={entry.key}
+                    scopeKey={entry.key}
+                    label={entry.label}
+                    scope={scope}
+                    view={view}
+                    expanded={expanded.has(entry.key)}
+                    stats={statsFor(entry.key)}
+                    go={go}
+                    onToggle={() => toggleExpanded(entry.key)}
                   />
                 ))}
                 <div className="mt-1 flex gap-2">
@@ -420,16 +565,16 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
 
             <NavItem
               label="Overdue"
-              active={view === "overdue"}
-              badge={counts.overdue}
+              active={scope === "all" && view === "overdue"}
+              badge={statsFor("all").overdue}
               danger
-              onClick={() => chooseView("overdue")}
+              onClick={() => go("all", "overdue")}
             />
             <NavItem
               label="Completed"
-              active={view === "completed"}
-              badge={counts.done}
-              onClick={() => chooseView("completed")}
+              active={scope === "all" && view === "completed"}
+              badge={statsFor("all").done}
+              onClick={() => go("all", "completed")}
             />
           </nav>
         </aside>
@@ -447,8 +592,14 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
                 {copied ? "Copied" : "Copy"}
               </button>
               <span className="ml-auto opacity-70">
-                {memberCount} {memberCount === 1 ? "member" : "members"}
+                {memberRows.length} {memberRows.length === 1 ? "member" : "members"}
               </span>
+              <button
+                onClick={() => setDialog("manage")}
+                className={`${btnClass} !px-3 !py-1 text-xs`}
+              >
+                Manage group
+              </button>
             </div>
           )}
 
@@ -479,9 +630,7 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
               onClick={() => setDialog("assign")}
               disabled={assignGroupId === null}
               title={
-                assignGroupId === null
-                  ? "Select tasks from one group to assign them"
-                  : ""
+                assignGroupId === null ? "Select tasks from one group to assign them" : ""
               }
               className={btnClass}
             >
@@ -556,6 +705,84 @@ export default function Dashboard({ userId, email }: { userId: string; email: st
           onAssign={assignSelected}
           onClose={() => setDialog(null)}
         />
+      )}
+      {dialog === "manage" && currentGroup && (
+        <GroupPanel
+          group={currentGroup}
+          members={memberRows}
+          currentUserId={userId}
+          isAdmin={isAdmin}
+          onRename={renameGroup}
+          onSetRole={changeRole}
+          onRemove={removeMember}
+          onResetCode={resetCode}
+          onLeave={leaveGroup}
+          onDelete={deleteGroup}
+          onClose={() => setDialog(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// One group in the sidebar: click the name for its open tasks,
+// click the arrow to show its Overdue and Completed lists.
+function GroupNavEntry({
+  scopeKey,
+  label,
+  scope,
+  view,
+  expanded,
+  stats,
+  go,
+  onToggle,
+}: {
+  scopeKey: string;
+  label: string;
+  scope: Scope;
+  view: View;
+  expanded: boolean;
+  stats: Stats;
+  go: (scope: Scope, view: View) => void;
+  onToggle: () => void;
+}) {
+  const here = scope === scopeKey;
+  return (
+    <div>
+      <div className="flex items-center gap-1">
+        <div className="min-w-0 flex-1">
+          <NavItem
+            label={label}
+            active={here && view === "home"}
+            badge={stats.open}
+            onClick={() => go(scopeKey, "home")}
+          />
+        </div>
+        <button
+          onClick={onToggle}
+          aria-expanded={expanded}
+          aria-label={`${expanded ? "Collapse" : "Expand"} ${label}`}
+          className="rounded px-2 py-2 text-xs opacity-70 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#6dffc4]"
+        >
+          {expanded ? "▾" : "▸"}
+        </button>
+      </div>
+      {expanded && (
+        <div className="ml-3 flex flex-col gap-1 border-l border-[#3ddc97]/20 pl-2">
+          <NavItem
+            label="Overdue"
+            active={here && view === "overdue"}
+            badge={stats.overdue}
+            danger
+            onClick={() => go(scopeKey, "overdue")}
+          />
+          <NavItem
+            label="Completed"
+            active={here && view === "completed"}
+            badge={stats.done}
+            onClick={() => go(scopeKey, "completed")}
+          />
+        </div>
       )}
     </div>
   );
